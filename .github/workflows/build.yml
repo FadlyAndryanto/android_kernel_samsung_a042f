@@ -1,0 +1,105 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build a04e kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          submodules: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            device-tree-compiler zip unzip cpio rsync \
+            python3 python3-pip git build-essential \
+            binutils-aarch64-linux-gnu
+
+      - name: Cache clang-r383902
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ~/clang-r383902
+          key: clang-r383902-v1
+
+      - name: Download clang-r383902
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/clang-r383902
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r383902.tar.gz -O /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C ~/clang-r383902
+          chmod +x ~/clang-r383902/bin/*
+
+      - name: Configure and build kernel
+        run: |
+          make -C "$(pwd)" O="$(pwd)/out" ARCH=arm64 \
+               CC=$HOME/clang-r383902/bin/clang \
+               CROSS_COMPILE=/usr/bin/aarch64-linux-gnu- \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               KCFLAGS=-w CONFIG_SECTION_MISMATCH_WARN_ONLY=y \
+               a04e_defconfig
+
+          make -C "$(pwd)" O="$(pwd)/out" ARCH=arm64 \
+               CC=$HOME/clang-r383902/bin/clang \
+               CROSS_COMPILE=/usr/bin/aarch64-linux-gnu- \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               KCFLAGS=-w CONFIG_SECTION_MISMATCH_WARN_ONLY=y \
+               -j"$(nproc)"
+
+      - name: Verify kernel image
+        run: ls -la out/arch/arm64/boot/Image.gz
+
+      - name: Pack AnyKernel3 zip
+        id: pack
+        run: |
+          VERSION=$(make -s kernelversion)
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          ZIP_NAME="AnyKernel3-a04e-${VERSION}-${SHORT_SHA}.zip"
+
+          git clone --depth=1 https://github.com/fadlyandryanto/AnyKernel3.git ak3
+          cp out/arch/arm64/boot/Image.gz ak3/Image.gz
+          ( cd ak3 && zip -r9 "../${ZIP_NAME}" . \
+              -x ".git/*" -x ".github/*" -x "README.md" -x ".gitignore" )
+
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          ls -la "${ZIP_NAME}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIP_NAME: ${{ steps.pack.outputs.zip_name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          SHORT_SHA: ${{ steps.pack.outputs.short_sha }}
+        run: |
+          TAG="a04e-latest"
+
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+
+          gh release create "$TAG" "$ZIP_NAME" \
+            --title "a04e — ${VERSION} (${SHORT_SHA})" \
+            --notes "**Kernel:** \`${VERSION}\`  
+          **Commit:** [\`${SHORT_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})  
+          **Build:** #${GITHUB_RUN_NUMBER}  
+          
+          Flash via AnyKernel3 in a custom recovery (TWRP / OrangeFox)." \
+            --latest
