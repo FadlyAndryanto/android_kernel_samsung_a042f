@@ -1,0 +1,191 @@
+name: Build Kernel
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: a04e-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  DEFCONFIG: a04e_defconfig
+  KCFLAGS: "-w -Wno-section-mismatch"
+  CLANG_VERSION: r383902
+  CLANG_ROOT: ${{ github.workspace }}/.toolchain/clang
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_COMPRESS: "true"
+  CCACHE_MAXSIZE: 3G
+  CCACHE_SLOPPINESS: file_stat_matches
+  DEBIAN_FRONTEND: noninteractive
+  TERM: dumb
+
+jobs:
+  build:
+    name: Build A04e kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev \
+            device-tree-compiler zip unzip cpio rsync \
+            python3 python3-pip build-essential git \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu ccache
+
+      - name: Restore Clang cache
+        id: clang
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CLANG_ROOT }}
+          key: aosp-clang-${{ env.CLANG_VERSION }}-v1
+
+      - name: Download Clang ${{ env.CLANG_VERSION }}
+        if: steps.clang.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "${CLANG_ROOT}"
+          curl -fsSL --retry 5 --retry-delay 3 -o /tmp/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-${CLANG_VERSION}.tar.gz"
+          tar -xzf /tmp/clang.tar.gz -C "${CLANG_ROOT}"
+          chmod +x "${CLANG_ROOT}/bin/"*
+          rm -f /tmp/clang.tar.gz
+          rm -rf "${CLANG_ROOT}/share" "${CLANG_ROOT}/lib64/cmake" "${CLANG_ROOT}/include"
+
+      - name: Save Clang cache
+        if: steps.clang.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CLANG_ROOT }}
+          key: aosp-clang-${{ env.CLANG_VERSION }}-v1
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-a04e-${{ github.run_id }}
+          restore-keys: ccache-a04e-
+
+      - name: Compute build info
+        id: info
+        run: |
+          set -euo pipefail
+          VERSION="$(make -s kernelversion)"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          ZIP_NAME="AnyKernel3-a04e-${VERSION}-${SHORT_SHA}.zip"
+          {
+            echo "version=${VERSION}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "zip_name=${ZIP_NAME}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION} @ ${SHORT_SHA} -> ${ZIP_NAME}"
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          export PATH="${CLANG_ROOT}/bin:$PATH"
+          test -f "arch/arm64/configs/${DEFCONFIG}" || { echo "defconfig missing"; exit 1; }
+          ccache -z
+
+          make O=out "${DEFCONFIG}" \
+            CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++"
+
+          make -j"$(nproc)" O=out \
+            CC="ccache clang" HOSTCC="ccache clang" HOSTCXX="ccache clang++"
+
+          ccache -s
+
+      - name: Save ccache
+        if: hashFiles('.ccache/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-a04e-${{ github.run_id }}
+
+      - name: Pack AnyKernel3
+        id: pack
+        run: |
+          set -euo pipefail
+
+          if [ -f out/arch/arm64/boot/Image.gz ]; then
+            IMG=out/arch/arm64/boot/Image.gz
+          elif [ -f out/arch/arm64/boot/Image ]; then
+            gzip -9 -c out/arch/arm64/boot/Image > out/arch/arm64/boot/Image.gz
+            IMG=out/arch/arm64/boot/Image.gz
+          else
+            echo "No kernel image produced"; exit 1
+          fi
+          test -s "${IMG}" || { echo "kernel image is empty"; exit 1; }
+          ls -lh "${IMG}"
+
+          git clone --depth=1 https://github.com/fadlyandryanto/AnyKernel3.git ak3
+          cp "${IMG}" ak3/Image.gz
+
+          ZIP="${{ steps.info.outputs.zip_name }}"
+          ( cd ak3 && zip -r9 "../${ZIP}" . \
+              -x ".git/*" -x ".github/*" -x "README.md" -x ".gitignore" )
+
+          test -s "${ZIP}" || { echo "zip is empty"; exit 1; }
+          unzip -l "${ZIP}" | grep -q "Image.gz" || { echo "Image.gz not in zip"; exit 1; }
+          ls -lh "${ZIP}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ steps.info.outputs.short_sha }}
+          path: ${{ steps.info.outputs.zip_name }}
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="a04e-latest"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "${{ steps.info.outputs.zip_name }}" \
+            --title "a04e — ${{ steps.info.outputs.version }} (${{ steps.info.outputs.short_sha }})" \
+            --notes "**Kernel:** \`${{ steps.info.outputs.version }}\`  
+          **Commit:** [\`${{ steps.info.outputs.short_sha }}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})  
+          **Build:** #${GITHUB_RUN_NUMBER}  
+
+          Flash via AnyKernel3 in a custom recovery (TWRP / OrangeFox)." \
+            --latest
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### a04e kernel build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.info.outputs.version }}\` |"
+            echo "| Commit | \`${{ steps.info.outputs.short_sha }}\` |"
+            echo "| Clang cache | ${{ steps.clang.outputs.cache-hit == 'true' && 'hit' || 'miss' }} |"
+            echo "| Zip | \`${{ steps.info.outputs.zip_name }}\` |"
+            echo ""
+            echo "#### ccache"
+            echo ""
+            echo '```'
+            ccache -s 2>/dev/null || echo "ccache stats unavailable"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
