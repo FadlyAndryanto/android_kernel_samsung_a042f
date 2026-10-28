@@ -268,7 +268,7 @@ static int inode_alloc_security(struct inode *inode)
 	return 0;
 }
 
-static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry);
+int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry);
 
 /*
  * Try reloading inode security labels that have been marked as invalid.  The
@@ -1549,7 +1549,7 @@ static int selinux_genfs_get_sid(struct dentry *dentry,
 }
 
 /* The inode's security attributes must be initialized before first use. */
-static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)
+int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dentry)
 {
 	struct superblock_security_struct *sbsec = NULL;
 	struct inode_security_struct *isec = inode->i_security;
@@ -1773,6 +1773,7 @@ out_invalid:
 	spin_unlock(&isec->lock);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(inode_doinit_with_dentry);
 
 /* Convert a Linux signal to an access vector. */
 static inline u32 signal_to_av(int sig)
